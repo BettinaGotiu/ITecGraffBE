@@ -15,11 +15,16 @@ const MIN_LEVEL = parseInt(process.env.MIN_LEVEL, 10) || 1;
 // Per-room countdown timer handles: { posterId: intervalId }
 const roomTimers = {};
 
+// Canvas area considered "full" for early-end check (95% threshold).
+const CANVAS_MAX_AREA = 50000;
+const COVERAGE_FULL_THRESHOLD = 0.95;
+
 // ─── Game timer helpers ───────────────────────────────────────────────────────
 
 function startRoomTimer(io, posterId) {
   if (roomTimers[posterId]) return; // already running
   roomManager.activateGame(posterId);
+  console.log(`[ROOM ${posterId}] Game started`);
 
   roomTimers[posterId] = setInterval(() => {
     const room = roomManager.getRoom(posterId);
@@ -32,11 +37,12 @@ function startRoomTimer(io, posterId) {
     const secondsLeft = Math.max(0, Math.ceil((room.gameEndTime - Date.now()) / 1000));
     const currentCoverage = gameEngine.getTeamCoverage(posterId) || {};
 
-    // Aliniat cu Frontend-ul: timeLeft și coverage trimise la fiecare secundă
-    io.to(posterId).emit('timerUpdate', { 
-      posterId, 
-      timeLeft: secondsLeft, 
-      coverage: currentCoverage 
+    console.log(`[ROOM ${posterId}] Timer tick: ${secondsLeft}s`);
+
+    io.to(posterId).emit('timerUpdate', {
+      posterId,
+      timeLeft: secondsLeft,
+      coverage: currentCoverage,
     });
 
     if (secondsLeft <= 0) {
@@ -49,15 +55,21 @@ function startRoomTimer(io, posterId) {
 
 async function finalizeGame(io, posterId) {
   const room = roomManager.getRoom(posterId);
-  if (!room) return;
+  // Guard against double-finalization or missing room.
+  if (!room || !room.gameActive) return;
 
   roomManager.deactivateGame(posterId);
 
   const result = gameEngine.calculateGameResult(posterId);
-  if (!result) return;
+  if (!result) {
+    roomManager.deleteRoom(posterId);
+    return;
+  }
 
   io.to(posterId).emit('gameResult', result);
-  console.log(`[gameResult] posterId=${posterId} winner=${result.winnerTeam}`);
+  console.log(
+    `[ROOM ${posterId}] Game finished. Winner: ${result.winnerTeam}. Coverage: ${JSON.stringify(result.teamScores)}`,
+  );
 
   // Persist strokes and user stats to Firestore (no-op when unconfigured).
   await firestoreService.saveStrokes(posterId, room.strokes);
@@ -69,6 +81,12 @@ async function finalizeGame(io, posterId) {
     userManager.updateUserStats(uid, { xp, wins: isWinner ? 1 : 0, gamesPlayed: 1 });
     await firestoreService.saveUserStats(uid, { xp, wins: isWinner ? 1 : 0, gamesPlayed: 1 });
   }
+
+  // Clean up room after a short delay to allow clients to process the result.
+  setTimeout(() => {
+    roomManager.deleteRoom(posterId);
+    console.log(`[ROOM ${posterId}] Room deleted after game end`);
+  }, 5000);
 }
 
 // ─── Join logic (shared by joinRoom and joinPosterRoom) ───────────────────────
@@ -121,7 +139,7 @@ function handleJoinRoom(socket, io, { posterId, userId, teamId }) {
   userManager.setCurrentPoster(userId, posterId);
   socket.join(posterId);
 
-  console.log(`[joinRoom] userId=${userId} teamId=${teamId} joined posterId=${posterId}`);
+  console.log(`[ROOM ${posterId}] Player joined: ${userId} (team ${teamId})`);
 
   // Start the game timer when the first user enters.
   if (!roomTimers[posterId]) {
@@ -138,11 +156,11 @@ function handleJoinRoom(socket, io, { posterId, userId, teamId }) {
     gameEndTime: room.gameEndTime,
   });
 
-  // Notify others that a new user joined.
-  socket.to(posterId).emit('userJoined', {
+  // Notify others that a new player joined.
+  io.to(posterId).emit('playerJoined', {
     userId,
     teamId,
-    rivalPresent, // Tells the client if an opposing team is also here
+    rivalPresent,
   });
 }
 
@@ -150,7 +168,7 @@ function handleJoinRoom(socket, io, { posterId, userId, teamId }) {
 
 function registerSocketHandlers(io) {
   io.on('connection', (socket) => {
-    console.log(`[socket] connected: ${socket.id}`);
+    console.log(`User connected: ${socket.id}`);
 
     // ── 1. Register User ────────────────────────────────────────────────────
     socket.on('registerUser', ({ userId, username, teamId, level } = {}) => {
@@ -191,16 +209,35 @@ function registerSocketHandlers(io) {
         return;
       }
 
+      if (!room.gameActive) {
+        console.warn(`[ROOM ${posterId}] drawBatch received but game is not active`);
+        return;
+      }
+
+      console.log(`[ROOM ${posterId}] drawBatch received from ${userId} | strokes: ${strokes.length}`);
+
       // Process strokes – updates team + user coverage.
       gameEngine.processDrawBatch(posterId, userId, teamId, strokes);
 
       // Broadcast drawUpdate to all users in the room (including sender).
       io.to(posterId).emit('drawUpdate', { posterId, strokes, teamId, userId });
+
+      // Check for early game end if canvas coverage reaches the threshold.
+      const totalCoverage = Object.values(room.teamCoverage).reduce((sum, v) => sum + v, 0);
+      if (totalCoverage >= CANVAS_MAX_AREA * COVERAGE_FULL_THRESHOLD) {
+        const coveragePct = Math.round((totalCoverage / CANVAS_MAX_AREA) * 100);
+        console.log(`[ROOM ${posterId}] Canvas coverage reached ${coveragePct}%, ending game early`);
+        if (roomTimers[posterId]) {
+          clearInterval(roomTimers[posterId]);
+          delete roomTimers[posterId];
+        }
+        finalizeGame(io, posterId);
+      }
     });
 
     // ── 4. Disconnect ───────────────────────────────────────────────────────
     socket.on('disconnect', () => {
-      console.log(`[socket] disconnected: ${socket.id}`);
+      console.log(`User disconnected: ${socket.id}`);
 
       const user = userManager.getUserBySocketId(socket.id);
       if (!user) return;
@@ -210,16 +247,18 @@ function registerSocketHandlers(io) {
       if (currentPoster) {
         roomManager.removeUserFromRoom(currentPoster, userId);
         io.to(currentPoster).emit('userLeft', { userId });
-        console.log(`[disconnect] userId=${userId} left posterId=${currentPoster}`);
+        console.log(`[ROOM ${currentPoster}] Player left: ${userId}`);
 
-        // If the room is now empty and game is still active, finalise early.
         const room = roomManager.getRoom(currentPoster);
-        if (room && room.gameActive && room.users.length === 0) {
-          if (roomTimers[currentPoster]) {
-            clearInterval(roomTimers[currentPoster]);
-            delete roomTimers[currentPoster];
+        if (room && room.users.length === 0) {
+          console.log(`[ROOM ${currentPoster}] Room terminated (no users left)`);
+          // Do NOT cancel the timer – let the game finish naturally so that
+          // any reconnecting client (or a future spectator) still receives
+          // the final gameResult event when the timer fires.
+          // If the game was never started, clean up immediately.
+          if (!room.gameActive && !roomTimers[currentPoster]) {
+            roomManager.deleteRoom(currentPoster);
           }
-          finalizeGame(io, currentPoster);
         }
       }
 
