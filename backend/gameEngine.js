@@ -3,11 +3,19 @@
  * Handles drawing-batch processing and territory-coverage calculations.
  *
  * Territory estimation:
- *   For each stroke: area = strokeLength * brushSize
- *   where strokeLength = number of points in the stroke.
+ *   For each stroke: area = numberOfPoints × brushSize
+ *
+ * XP formula:
+ *   baseXP   = floor(userCoverage)
+ *   winBonus = WIN_BONUS_XP  (awarded to every member of the winning team)
+ *   userXP   = baseXP + winBonus (if winner) OR baseXP (if not)
  */
 
 const roomManager = require('./roomManager');
+
+// XP constants.
+const XP_PER_AREA_UNIT = 1; // 1 XP per area-unit contributed
+const WIN_BONUS_XP = 100;   // flat bonus for being on the winning team
 
 /**
  * Calculate the territory contribution of a single stroke.
@@ -22,18 +30,19 @@ function calcStrokeArea(stroke) {
 }
 
 /**
- * Process a batch of strokes for a team and update room state.
+ * Process a batch of strokes for a user/team and update room state.
+ * Updates both team coverage and per-user coverage.
  *
  * @param {string} posterId
- * @param {string} teamId   - expected to be "teamA" or "teamB"
+ * @param {string} userId
+ * @param {string} teamId
  * @param {object[]} strokes
- * @returns {object} Updated teamCoverage object.
+ * @returns {{ teamCoverage: object, userCoverage: object } | null}
  */
-function processDrawBatch(posterId, teamId, strokes) {
+function processDrawBatch(posterId, userId, teamId, strokes) {
   const room = roomManager.getRoom(posterId);
   if (!room) return null;
 
-  // Accumulate area for each stroke
   let addedArea = 0;
   strokes.forEach((stroke) => {
     addedArea += calcStrokeArea(stroke);
@@ -42,18 +51,89 @@ function processDrawBatch(posterId, teamId, strokes) {
   // Persist strokes
   roomManager.appendStrokes(posterId, strokes);
 
-  // Update coverage for the team.
-  // We accept any teamId key so the system is extensible, but default to teamA/teamB.
-  const coverage = { ...room.teamCoverage };
-  if (typeof coverage[teamId] === 'number') {
-    coverage[teamId] += addedArea;
+  // Update team coverage (supports any number of teams)
+  const teamCoverage = { ...room.teamCoverage };
+  if (typeof teamCoverage[teamId] === 'number') {
+    teamCoverage[teamId] += addedArea;
   } else {
-    // Unknown team key – initialise it
-    coverage[teamId] = addedArea;
+    teamCoverage[teamId] = addedArea;
   }
+  roomManager.updateTeamCoverage(posterId, teamCoverage);
 
-  roomManager.updateTeamCoverage(posterId, coverage);
-  return coverage;
+  // Update per-user coverage
+  roomManager.addUserCoverage(posterId, userId, addedArea);
+
+  return {
+    teamCoverage: { ...room.teamCoverage },
+    userCoverage: { ...room.userCoverage },
+  };
+}
+
+/**
+ * Determine the winning team (highest coverage).
+ * Returns null if coverage is empty or all zero.
+ * @param {object} teamCoverage - { teamId: number }
+ * @returns {string|null}
+ */
+function determineWinner(teamCoverage) {
+  const entries = Object.entries(teamCoverage);
+  if (entries.length === 0) return null;
+  let winner = null;
+  let maxCoverage = -1;
+  entries.forEach(([teamId, coverage]) => {
+    if (coverage > maxCoverage) {
+      maxCoverage = coverage;
+      winner = teamId;
+    }
+  });
+  return maxCoverage > 0 ? winner : null;
+}
+
+/**
+ * Calculate the final game result for a room.
+ *
+ * Returns:
+ * {
+ *   posterId:    string,
+ *   winnerTeam:  string | null,
+ *   coverage:    { teamId: number },
+ *   xp:          { userId: number },
+ * }
+ *
+ * @param {string} posterId
+ * @param {object} [teamMembersOverride]  – optional snapshot (used internally)
+ * @returns {object|null}
+ */
+function calculateGameResult(posterId) {
+  const room = roomManager.getRoom(posterId);
+  if (!room) return null;
+
+  const winnerTeam = determineWinner(room.teamCoverage);
+
+  // Build per-user XP map
+  const xp = {};
+  const winningMembers = winnerTeam && room.teamMembers[winnerTeam]
+    ? new Set(room.teamMembers[winnerTeam])
+    : new Set();
+
+  // Include every user who contributed coverage (even if disconnected)
+  const allUserIds = new Set([
+    ...room.users,
+    ...Object.keys(room.userCoverage),
+  ]);
+
+  allUserIds.forEach((uid) => {
+    const baseXP = Math.floor((room.userCoverage[uid] || 0) * XP_PER_AREA_UNIT);
+    const bonus = winningMembers.has(uid) ? WIN_BONUS_XP : 0;
+    xp[uid] = baseXP + bonus;
+  });
+
+  return {
+    posterId,
+    winnerTeam,
+    coverage: { ...room.teamCoverage },
+    xp,
+  };
 }
 
 /**
@@ -66,4 +146,10 @@ function getTeamCoverage(posterId) {
   return room ? { ...room.teamCoverage } : null;
 }
 
-module.exports = { processDrawBatch, getTeamCoverage };
+module.exports = {
+  processDrawBatch,
+  calculateGameResult,
+  getTeamCoverage,
+  WIN_BONUS_XP,
+  XP_PER_AREA_UNIT,
+};
