@@ -19,7 +19,7 @@
 const MAX_STROKES_PER_ROOM = 5000;
 
 // Game configuration – override via environment variables if desired.
-const GAME_DURATION_SECONDS = parseInt(process.env.GAME_DURATION_SECONDS, 10) || 300;
+const GAME_DURATION_SECONDS = 35;
 
 const rooms = {};
 

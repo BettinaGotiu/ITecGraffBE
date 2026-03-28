@@ -30,7 +30,14 @@ function startRoomTimer(io, posterId) {
     }
 
     const secondsLeft = Math.max(0, Math.ceil((room.gameEndTime - Date.now()) / 1000));
-    io.to(posterId).emit('timerUpdate', { posterId, secondsLeft });
+    const currentCoverage = gameEngine.getTeamCoverage(posterId) || {};
+
+    // Aliniat cu Frontend-ul: timeLeft și coverage trimise la fiecare secundă
+    io.to(posterId).emit('timerUpdate', { 
+      posterId, 
+      timeLeft: secondsLeft, 
+      coverage: currentCoverage 
+    });
 
     if (secondsLeft <= 0) {
       clearInterval(roomTimers[posterId]);
@@ -122,49 +129,25 @@ function handleJoinRoom(socket, io, { posterId, userId, teamId }) {
   }
 
   // Send full room state to the joining user.
-  const secondsLeft = Math.max(0, Math.ceil((room.gameEndTime - Date.now()) / 1000));
   socket.emit('roomState', {
-    posterId: room.posterId,
+    posterId,
     strokes: room.strokes,
+    teamMembers: room.teamMembers,
     teamCoverage: room.teamCoverage,
-    userCoverage: room.userCoverage,
-    secondsLeft,
+    gameActive: room.gameActive,
+    gameEndTime: room.gameEndTime,
   });
 
   // Notify others that a new user joined.
-  socket.to(posterId).emit('userJoined', { userId, teamId, posterId });
-
-  // Side-events: rival entered.
-  if (rivalPresent) {
-    // Tell the joining user there are already rivals on the poster.
-    socket.emit('rivalEntered', {
-      posterId,
-      rivalTeams: existingTeams,
-      message: `Rival team(s) ${existingTeams.join(', ')} are already on this poster!`,
-    });
-    // Tell existing users a rival from a different team arrived.
-    socket.to(posterId).emit('rivalEntered', {
-      posterId,
-      userId,
-      teamId,
-      message: `A rival from team ${teamId} has entered the poster!`,
-    });
-    // Trigger haptic/glitch animation on existing users' devices.
-    socket.to(posterId).emit('sideEvent', {
-      type: 'hapticFeedback',
-      posterId,
-      triggerBy: userId,
-      teamId,
-    });
-  }
+  socket.to(posterId).emit('userJoined', {
+    userId,
+    teamId,
+    rivalPresent, // Tells the client if an opposing team is also here
+  });
 }
 
-// ─── Main handler registration ────────────────────────────────────────────────
+// ─── Socket.IO Handler Registration ───────────────────────────────────────────
 
-/**
- * Attach Socket.IO event handlers to the given `io` instance.
- * @param {import('socket.io').Server} io
- */
 function registerSocketHandlers(io) {
   io.on('connection', (socket) => {
     console.log(`[socket] connected: ${socket.id}`);

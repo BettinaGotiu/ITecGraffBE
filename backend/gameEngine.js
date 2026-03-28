@@ -1,32 +1,33 @@
 /**
  * gameEngine.js
- * Handles drawing-batch processing and territory-coverage calculations.
- *
- * Territory estimation:
- *   For each stroke: area = numberOfPoints × brushSize
- *
- * XP formula:
- *   baseXP   = floor(userCoverage)
- *   winBonus = WIN_BONUS_XP  (awarded to every member of the winning team)
- *   userXP   = baseXP + winBonus (if winner) OR baseXP (if not)
+ * Contains game logic: stroke area calculation, game state updates, and result calculation.
  */
 
 const roomManager = require('./roomManager');
 
-// XP constants.
-const XP_PER_AREA_UNIT = 1; // 1 XP per area-unit contributed
-const WIN_BONUS_XP = 100;   // flat bonus for being on the winning team
+// Tuning parameters
+const XP_PER_AREA_UNIT = 0.5;
+const WIN_BONUS_XP = 50;
 
 /**
- * Calculate the territory contribution of a single stroke.
- * area ≈ number_of_points × brush_size
- * @param {object} stroke - { points: Array, size: number }
+ * Calculate the rough "area" of a stroke.
+ * Currently uses bounding box area or total segment length.
+ * @param {object} stroke
  * @returns {number}
  */
 function calcStrokeArea(stroke) {
-  const pointCount = Array.isArray(stroke.points) ? stroke.points.length : 0;
-  const brushSize = typeof stroke.size === 'number' ? stroke.size : 1;
-  return pointCount * brushSize;
+  if (!stroke || !Array.isArray(stroke.points) || stroke.points.length < 2) {
+    return 1;
+  }
+  let area = 0;
+  for (let i = 1; i < stroke.points.length; i++) {
+    const p1 = stroke.points[i - 1];
+    const p2 = stroke.points[i];
+    const dx = p2.x - p1.x;
+    const dy = p2.y - p1.y;
+    area += Math.sqrt(dx * dx + dy * dy);
+  }
+  return area * (stroke.brushSize || 5);
 }
 
 /**
@@ -96,7 +97,7 @@ function determineWinner(teamCoverage) {
  * {
  *   posterId:    string,
  *   winnerTeam:  string | null,
- *   coverage:    { teamId: number },
+ *   teamScores:  { teamId: number },
  *   xp:          { userId: number },
  * }
  *
@@ -131,7 +132,7 @@ function calculateGameResult(posterId) {
   return {
     posterId,
     winnerTeam,
-    coverage: { ...room.teamCoverage },
+    teamScores: { ...room.teamCoverage }, // Aliniat cu așteptările Frontend-ului (înainte era "coverage")
     xp,
   };
 }
@@ -150,6 +151,4 @@ module.exports = {
   processDrawBatch,
   calculateGameResult,
   getTeamCoverage,
-  WIN_BONUS_XP,
-  XP_PER_AREA_UNIT,
 };
